@@ -306,6 +306,51 @@ const splitQKVShader = `
 `;
 
 // Calculates attention weights from Q and K matrices.
+const attentionWeightsShaderNew = `
+  struct Matrix {
+    data: array<f32>,
+  }
+
+  struct Dimensions {
+    dimY: u32, // output row dim, Q row dim
+    dimX: u32, // output col dim, seq_length * heads
+    seqLength: u32, // seq_length or K col dim (Q can be different)
+    qkvCols: u32, // head col dim for Q, K or n_embd / n_heads
+    embedDim: u32, // n_embd or total Q col dim & K row dim
+  };
+
+  @group(1) @binding(0) var<storage, read> Queries: Matrix;
+  @group(1) @binding(1) var<storage, read> Keys: Matrix;
+
+  @group(0) @binding(0) var<uniform> DimBuffer: Dimensions;
+  @group(0) @binding(1) var<storage, read_write> Result: Matrix;
+
+  @compute @workgroup_size(16, 16)
+  fn main (@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let row: u32 = global_id.x;
+    let col: u32 = global_id.y;
+    let dimY: u32 = DimBuffer.dimY;
+    let dimX: u32 = DimBuffer.dimX;
+    let seqLength: u32 = DimBuffer.seqLength;
+    let qkvCols: u32 = DimBuffer.qkvCols;
+    let embedDim: u32 = DimBuffer.embedDim;
+
+    if (row >= dimY || col >= dimX) {
+      return;
+    }
+
+    var head: u32 = col / seqLength;
+    var col_r: u32 = col % seqLength;
+    var sum: f32 = 0.0;
+    for (var i: u32 = 0; i < qkvCols; i = i + 1) {
+        sum = sum + Queries.data[row * embedDim + i + head * qkvCols] * Keys.data[col_r * embedDim + i + head * qkvCols];
+    }
+
+    Result.data[row * dimX + col] = sum;
+  }
+`;
+
+// Calculates attention weights from Q and K matrices.
 const attentionWeightsShader = `
   struct Matrix {
     data: array<f32>,
@@ -828,6 +873,183 @@ function inlineFFN(
   return secondLayerResultBuffer;
 }
 
+// Writing this without splitting for now just to make things simple. Very late can't think well.
+function cachedInlineAttention(
+  device,
+  queue,
+  commandEncoder,
+  seq_length,
+  n_embd,
+  attentionDotProductScale,
+  inputBuffer,
+  n_head,
+  qkvWeightsBuffer,
+  qkvBiasBuffer,
+  linearWeightsBuffer,
+  linearBiasBuffer,
+  attentionCacheBuffer,
+  doOverflowAttention
+) {
+  // This could be cached as well.
+  const qkvUniformBuffer = createBuffer(device, 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+  const qkvResultBuffer = createBuffer(device, bufferSizeCalc(seq_length, 3 * n_embd), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+  const qkvBindGroup = createBindGroup(device, u_r_r_s_BindLayout, [qkvUniformBuffer, qkvBiasBuffer, qkvWeightsBuffer, qkvResultBuffer]);
+  queue.writeBuffer(qkvUniformBuffer, 0, new Uint32Array([seq_length, 3 * n_embd, n_embd]));
+
+  const splitQKVUniformBuffer = createBuffer(device, 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+  const splitQResultBuffer = createBuffer(device, bufferSizeCalc(seq_length, n_embd), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+  const splitKResultBuffer = createBuffer(device, bufferSizeCalc(seq_length, n_embd), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+  const splitVResultBuffer = createBuffer(device, bufferSizeCalc(seq_length, n_embd), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+  const splitQKVBindGroup = createBindGroup(device, u_s_s_s_BindLayout, [splitQKVUniformBuffer, splitQResultBuffer, splitKResultBuffer, splitVResultBuffer]);
+  queue.writeBuffer(splitQKVUniformBuffer, 0, new Uint32Array([seq_length, n_embd]));
+
+  const singleQResultBuffer = createBuffer(device, bufferSizeCalc(1, n_embd), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
+
+  const attentionWeightsUniformBuffer = createBuffer(device, 32, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+  const attentionWeightsResultBuffer = createBuffer(
+    device,
+    bufferSizeCalc(1, seq_length * n_head),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+  );
+  const attentionWeightsBindGroup = createBindGroup(device, u_s_BindLayout, [attentionWeightsUniformBuffer, attentionWeightsResultBuffer]);
+  queue.writeBuffer(attentionWeightsUniformBuffer, 0, new Uint32Array([1, seq_length * n_head, seq_length, n_embd / n_head, n_embd]));
+
+  const multiplyUniformBuffer = createBuffer(device, 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+  const multiplyResultBuffer = createBuffer(device, bufferSizeCalc(1, seq_length * n_head), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+  const multiplyBindGroup = createBindGroup(device, u_s_BindLayout, [multiplyUniformBuffer, multiplyResultBuffer]);
+  queue.writeBuffer(multiplyUniformBuffer, 0, new Uint32Array([1, seq_length * n_head]));
+  queue.writeBuffer(multiplyUniformBuffer, 8, new Float32Array([attentionDotProductScale]));
+
+  const causalMaskCachedResultBuffer = createBuffer(
+    device,
+    bufferSizeCalc(seq_length * n_head, seq_length),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+  );
+
+  const attentionValuesUniformBuffer = createBuffer(device, 32, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+  const attentionValuesResultBuffer = createBuffer(device, bufferSizeCalc(seq_length, n_embd), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+  const attentionValuesBindGroup = createBindGroup(device, u_s_BindLayout, [attentionValuesUniformBuffer, attentionValuesResultBuffer]);
+  queue.writeBuffer(attentionValuesUniformBuffer, 0, new Uint32Array([seq_length, n_embd, n_head, n_embd / n_head]));
+
+  const linearUniformBuffer = createBuffer(device, 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+
+  const linearResultBuffer = createBuffer(device, bufferSizeCalc(seq_length, n_embd), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+  const linearBindGroup = createBindGroup(device, u_r_r_s_BindLayout, [linearUniformBuffer, linearBiasBuffer, linearWeightsBuffer, linearResultBuffer]);
+  queue.writeBuffer(linearUniformBuffer, 0, new Uint32Array([seq_length, n_embd, n_embd]));
+
+  const passEncoder_qkv = commandEncoder.beginComputePass();
+  passEncoder_qkv.setPipeline(FFNpipeline);
+  passEncoder_qkv.setBindGroup(0, qkvBindGroup);
+  passEncoder_qkv.setBindGroup(1, createBindGroup(device, r_BindLayout, [inputBuffer]));
+  passEncoder_qkv.dispatchWorkgroups(workgroupCalc(seq_length, workgroup_Y), workgroupCalc(3 * n_embd, workgroup_X));
+  passEncoder_qkv.end();
+
+  const passEncoder_splitQKV = commandEncoder.beginComputePass();
+  passEncoder_splitQKV.setPipeline(splitQKVpipeline);
+  passEncoder_splitQKV.setBindGroup(0, splitQKVBindGroup);
+  passEncoder_splitQKV.setBindGroup(1, createBindGroup(device, r_BindLayout, [qkvResultBuffer]));
+  passEncoder_splitQKV.dispatchWorkgroups(workgroupCalc(seq_length, workgroup_Y), workgroupCalc(n_embd, workgroup_X));
+  passEncoder_splitQKV.end();
+
+  commandEncoder.copyBufferToBuffer(splitQResultBuffer, bufferSizeCalc(n_embd) * (seq_length - 1), singleQResultBuffer, 0, bufferSizeCalc(n_embd));
+
+  const passEncoder_attentionWeights = commandEncoder.beginComputePass();
+  passEncoder_attentionWeights.setPipeline(attentionWeightsPipeline);
+  passEncoder_attentionWeights.setBindGroup(0, attentionWeightsBindGroup);
+  passEncoder_attentionWeights.setBindGroup(1, createBindGroup(device, r_r_BindLayout, [singleQResultBuffer, splitKResultBuffer]));
+  passEncoder_attentionWeights.dispatchWorkgroups(workgroupCalc(1, workgroup_Y), workgroupCalc(seq_length * n_head, workgroup_X));
+  passEncoder_attentionWeights.end();
+
+  const passEncoder_multiply = commandEncoder.beginComputePass();
+  passEncoder_multiply.setPipeline(multiplyPipeline);
+  passEncoder_multiply.setBindGroup(0, multiplyBindGroup);
+  passEncoder_multiply.setBindGroup(1, createBindGroup(device, r_BindLayout, [attentionWeightsResultBuffer]));
+  passEncoder_multiply.dispatchWorkgroups(workgroupCalc(1, workgroup_Y), workgroupCalc(seq_length * n_head, workgroup_X));
+  passEncoder_multiply.end();
+
+  for (let i = 0; i < n_head - 1; i++) {
+    commandEncoder.copyBufferToBuffer(
+      multiplyResultBuffer,
+      bufferSizeCalc(seq_length) * i,
+      causalMaskCachedResultBuffer,
+      bufferSizeCalc(seq_length, seq_length) * (i + 1) - bufferSizeCalc(seq_length),
+      bufferSizeCalc(seq_length)
+    );
+  }
+  if (doOverflowAttention) {
+    for (let i = 0; i < n_head; i++) {
+      for (let j = 1; j < seq_length; j++) {
+        commandEncoder.copyBufferToBuffer(
+          attentionCacheBuffer,
+          bufferSizeCalc(seq_length) * j + bufferSizeCalc(seq_length, seq_length) * i + 1 * Float32Array.BYTES_PER_ELEMENT,
+          causalMaskCachedResultBuffer,
+          bufferSizeCalc(seq_length) * (j - 1) + bufferSizeCalc(seq_length, seq_length) * i,
+          bufferSizeCalc(seq_length - 1)
+        );
+      }
+    }
+  } else {
+    for (let i = 0; i < n_head; i++) {
+      for (let j = 0; j < seq_length - 1; j++) {
+        commandEncoder.copyBufferToBuffer(
+          attentionCacheBuffer,
+          bufferSizeCalc(seq_length - 1) * j + bufferSizeCalc(seq_length - 1, seq_length - 1) * i,
+          causalMaskCachedResultBuffer,
+          bufferSizeCalc(seq_length) * j + bufferSizeCalc(seq_length, seq_length) * i,
+          bufferSizeCalc(seq_length - 1)
+        );
+      }
+    }
+  }
+  // Save for next iteration.
+  commandEncoder.copyBufferToBuffer(causalMaskCachedResultBuffer, 0, attentionCacheBuffer, 0, bufferSizeCalc(seq_length * n_head, seq_length));
+
+  // This is a sloppy-ish solution to the casual mask buffer being processed with every head at once. Obviously, this could be fixed if we just did this in a smarter way but I only realized you could do this at the end. Still learning WebGPU!
+  const softmaxOutputBuffer = createBuffer(
+    device,
+    bufferSizeCalc(seq_length, seq_length * n_head),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
+  );
+  for (let i = 0; i < n_head; i++) {
+    const softmaxInputBuffer = createBuffer(
+      device,
+      bufferSizeCalc(seq_length, seq_length),
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
+    );
+    commandEncoder.copyBufferToBuffer(
+      causalMaskCachedResultBuffer,
+      i * bufferSizeCalc(seq_length, seq_length),
+      softmaxInputBuffer,
+      0,
+      bufferSizeCalc(seq_length, seq_length)
+    );
+    const softMaxResultBuffer = inlineSoftmax(device, queue, commandEncoder, seq_length, seq_length, softmaxInputBuffer);
+    commandEncoder.copyBufferToBuffer(
+      softMaxResultBuffer,
+      0,
+      softmaxOutputBuffer,
+      i * bufferSizeCalc(seq_length, seq_length),
+      bufferSizeCalc(seq_length, seq_length)
+    );
+  }
+
+  const passEncoder_attentionValues = commandEncoder.beginComputePass();
+  passEncoder_attentionValues.setPipeline(attentionValuesPipeline);
+  passEncoder_attentionValues.setBindGroup(0, attentionValuesBindGroup);
+  passEncoder_attentionValues.setBindGroup(1, createBindGroup(device, r_r_BindLayout, [softmaxOutputBuffer, splitVResultBuffer]));
+  passEncoder_attentionValues.dispatchWorkgroups(workgroupCalc(seq_length, workgroup_Y), workgroupCalc(n_embd, workgroup_X));
+  passEncoder_attentionValues.end();
+
+  const passEncoder_linear = commandEncoder.beginComputePass();
+  passEncoder_linear.setPipeline(FFNpipeline);
+  passEncoder_linear.setBindGroup(0, linearBindGroup);
+  passEncoder_linear.setBindGroup(1, createBindGroup(device, r_BindLayout, [attentionValuesResultBuffer]));
+  passEncoder_linear.dispatchWorkgroups(workgroupCalc(seq_length, workgroup_Y), workgroupCalc(n_embd, workgroup_X));
+  passEncoder_linear.end();
+
+  return linearResultBuffer;
+}
+
 function inlineAttention(
   device,
   queue,
@@ -840,7 +1062,8 @@ function inlineAttention(
   qkvWeightsBuffer,
   qkvBiasBuffer,
   linearWeightsBuffer,
-  linearBiasBuffer
+  linearBiasBuffer,
+  attentionCacheBuffer
 ) {
   if (n_embd % n_head != 0) {
     throw new Error("cols must be divisible by n_head");
@@ -858,10 +1081,10 @@ function inlineAttention(
   const splitQKVBindGroup = createBindGroup(device, u_s_s_s_BindLayout, [splitQKVUniformBuffer, splitQResultBuffer, splitKResultBuffer, splitVResultBuffer]);
   queue.writeBuffer(splitQKVUniformBuffer, 0, new Uint32Array([seq_length, n_embd]));
 
-  const attentionWeightsUniformBuffer = createBuffer(device, 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+  const attentionWeightsUniformBuffer = createBuffer(device, 32, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
   const attentionWeightsResultBuffer = createBuffer(device, bufferSizeCalc(seq_length, seq_length * n_head), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
   const attentionWeightsBindGroup = createBindGroup(device, u_s_BindLayout, [attentionWeightsUniformBuffer, attentionWeightsResultBuffer]);
-  queue.writeBuffer(attentionWeightsUniformBuffer, 0, new Uint32Array([seq_length, seq_length * n_head, n_embd / n_head, n_embd]));
+  queue.writeBuffer(attentionWeightsUniformBuffer, 0, new Uint32Array([seq_length, seq_length * n_head, seq_length, n_embd / n_head, n_embd]));
 
   const multiplyUniformBuffer = createBuffer(device, 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
   const multiplyResultBuffer = createBuffer(device, bufferSizeCalc(seq_length, seq_length * n_head), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
@@ -874,7 +1097,7 @@ function inlineAttention(
   const causalMaskBindGroup = createBindGroup(device, u_s_BindLayout, [causalMaskUniformBuffer, causalMaskResultBuffer]);
   queue.writeBuffer(causalMaskUniformBuffer, 0, new Uint32Array([seq_length * n_head, seq_length])); // Transposes! This is needed for softmax.
 
-  const attentionValuesUniformBuffer = createBuffer(device, 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+  const attentionValuesUniformBuffer = createBuffer(device, 32, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
   const attentionValuesResultBuffer = createBuffer(device, bufferSizeCalc(seq_length, n_embd), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
   const attentionValuesBindGroup = createBindGroup(device, u_s_BindLayout, [attentionValuesUniformBuffer, attentionValuesResultBuffer]);
   queue.writeBuffer(attentionValuesUniformBuffer, 0, new Uint32Array([seq_length, n_embd, n_head, n_embd / n_head]));
@@ -900,11 +1123,14 @@ function inlineAttention(
   passEncoder_splitQKV.end();
 
   const passEncoder_attentionWeights = commandEncoder.beginComputePass();
-  passEncoder_attentionWeights.setPipeline(attentionWeightsPipeline);
+  passEncoder_attentionWeights.setPipeline(attentionWeightsNewPipeline);
   passEncoder_attentionWeights.setBindGroup(0, attentionWeightsBindGroup);
   passEncoder_attentionWeights.setBindGroup(1, createBindGroup(device, r_r_BindLayout, [splitQResultBuffer, splitKResultBuffer]));
   passEncoder_attentionWeights.dispatchWorkgroups(workgroupCalc(seq_length, workgroup_Y), workgroupCalc(seq_length * n_head, workgroup_X));
   passEncoder_attentionWeights.end();
+
+  // Save for next iteration.
+  commandEncoder.copyBufferToBuffer(attentionWeightsResultBuffer, 0, attentionCacheBuffer, 0, bufferSizeCalc(seq_length * n_head, seq_length));
 
   const passEncoder_multiply = commandEncoder.beginComputePass();
   passEncoder_multiply.setPipeline(multiplyPipeline);

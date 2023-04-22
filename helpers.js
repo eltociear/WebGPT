@@ -27,6 +27,7 @@ async function initializeWebGPU() {
   GELUpipeline = createPipeline(device, GELUShader, [u_s_BindLayout, r_BindLayout]);
   splitQKVpipeline = createPipeline(device, splitQKVShader, [u_s_s_s_BindLayout, r_BindLayout]);
   attentionWeightsPipeline = createPipeline(device, attentionWeightsShader, [u_s_BindLayout, r_r_BindLayout]);
+  attentionWeightsNewPipeline = createPipeline(device, attentionWeightsShaderNew, [u_s_BindLayout, r_r_BindLayout]);
   attentionValuesPipeline = createPipeline(device, attentionValuesShader, [u_s_BindLayout, r_r_BindLayout]);
   multiplyPipeline = createPipeline(device, multiplyShader, [u_s_BindLayout, r_BindLayout]);
   causalMaskPipeline = createPipeline(device, causalMaskShader, [u_s_BindLayout, r_BindLayout]);
@@ -47,6 +48,7 @@ let FFNpipeline;
 let GELUpipeline;
 let splitQKVpipeline;
 let attentionWeightsPipeline;
+let attentionWeightsNewPipeline;
 let attentionValuesPipeline;
 let multiplyPipeline;
 let causalMaskPipeline;

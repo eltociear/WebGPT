@@ -32,7 +32,7 @@ async function* generate(prompt, max_new_tokens, top_k = 10, temperature = 1.0) 
     const idx_cond = history.slice(-block_size);
 
     const startTime = performance.now();
-    const logits = await runGPT(idx_cond);
+    const logits = await runGPT(idx_cond, i === 0, history.length > block_size);
     const endTime = performance.now();
 
     console.log(`Kernel execution time: ${endTime - startTime} ms`);
@@ -49,7 +49,7 @@ async function* generate(prompt, max_new_tokens, top_k = 10, temperature = 1.0) 
   }
 }
 
-async function runGPT(idx) {
+async function runGPT(idx, doInitialization = true, doCropWeights = false) {
   if (!modelParams) {
     console.log("Model not loaded yet");
     return;
@@ -103,20 +103,41 @@ async function runGPT(idx) {
       buffers.normAttentionBetaBuffer
     );
 
-    const attentionOutputBuffer = inlineAttention(
-      device,
-      queue,
-      commandEncoder,
-      seq_length,
-      n_embd,
-      attentionDotProductScale,
-      layerNormAttentionOutputBuffer,
-      n_head,
-      buffers.qkvWeightsBuffer,
-      buffers.qkvBiasBuffer,
-      buffers.linearWeightsBuffer,
-      buffers.linearBiasBuffer
-    );
+    let attentionOutputBuffer;
+    if (doInitialization) {
+      attentionOutputBuffer = inlineAttention(
+        device,
+        queue,
+        commandEncoder,
+        seq_length,
+        n_embd,
+        attentionDotProductScale,
+        layerNormAttentionOutputBuffer,
+        n_head,
+        buffers.qkvWeightsBuffer,
+        buffers.qkvBiasBuffer,
+        buffers.linearWeightsBuffer,
+        buffers.linearBiasBuffer,
+        buffers.attentionWeightCacheBuffer
+      );
+    } else {
+      attentionOutputBuffer = cachedInlineAttention(
+        device,
+        queue,
+        commandEncoder,
+        seq_length,
+        n_embd,
+        attentionDotProductScale,
+        layerNormAttentionOutputBuffer,
+        n_head,
+        buffers.qkvWeightsBuffer,
+        buffers.qkvBiasBuffer,
+        buffers.linearWeightsBuffer,
+        buffers.linearBiasBuffer,
+        buffers.attentionWeightCacheBuffer,
+        doCropWeights
+      );
+    }
 
     const residualAttentionOutputBuffer = inlineResidual(device, queue, commandEncoder, seq_length, n_embd, attentionOutputBuffer, layerOutputBuffer);
 
@@ -208,10 +229,14 @@ async function runGPT(idx) {
     commandEncoder.copyBufferToBuffer(deEmbedChunkResultBuffer, 0, deEmbedOutputBuffer, i * bufferSizeCalc(vocabChunkSize), bufferSizeCalc(vocabChunkSize));
   }
 
+  // const attentionWeightCacheBufferOutput = createOutputBuffer(device, commandEncoder, attentionWeightCacheBuffer, seq_length * n_head, seq_length);
+
   queue.submit([commandEncoder.finish()]);
 
+  // await attentionWeightCacheBufferOutput.mapAsync(GPUMapMode.READ);
   await deEmbedOutputBuffer.mapAsync(GPUMapMode.READ);
   const output = deEmbedOutputBuffer.getMappedRange();
+  // console.log("attention cache", new Float32Array(attentionWeightCacheBufferOutput));
 
   return new Float32Array(output);
 }
@@ -232,6 +257,8 @@ async function loadModel(folder) {
   paramsJSON.attentionDotProductScale = 1 / Math.sqrt(n_embd / n_head);
   const { hidden_size } = paramsJSON;
   console.log("Params:", paramsJSON);
+
+  if (n_embd % n_head != 0) throw new Error("Model load failed: n_embd must be divisible by n_head.");
 
   console.log("Loading token embeddings...");
   const embeddingWeights = await loadBinaryFile("models/" + folder + "/transformer.wte.weight_gpt.bin");
@@ -269,6 +296,12 @@ async function loadModel(folder) {
     const qkvBiasBuffer = createBuffer(device, bufferSizeCalc(3 * n_embd), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
     queue.writeBuffer(qkvWeightsBuffer, 0, transposeArray(qkv_weights, 3 * n_embd, n_embd));
     queue.writeBuffer(qkvBiasBuffer, 0, qkv_bias);
+
+    const attentionWeightCacheBuffer = createBuffer(
+      device,
+      bufferSizeCalc(block_size * n_head, block_size),
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
+    );
 
     console.log("\tLoading attention c_proj...");
     const linear_weights = await loadBinaryFile(`models/${folder}/${prefix}attn.c_proj.weight_gpt.bin`);
@@ -315,6 +348,7 @@ async function loadModel(folder) {
       firstLayerBiasBuffer,
       secondLayerWeightsBuffer,
       secondLayerBiasBuffer,
+      attentionWeightCacheBuffer,
     });
   }
 
