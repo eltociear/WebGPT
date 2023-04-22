@@ -35,6 +35,8 @@ async function* generate(prompt, max_new_tokens, top_k = 10, temperature = 1.0) 
     const logits = await runGPT(idx_cond, i === 0, history.length > block_size);
     const endTime = performance.now();
 
+    console.log(logits);
+
     console.log(`Kernel execution time: ${endTime - startTime} ms`);
 
     const { topKIndices, topKProbs } = selectTopK(logits, top_k);
@@ -89,6 +91,8 @@ async function runGPT(idx, doInitialization = true, doCropWeights = false) {
   const embeddedInputBuffer = inlineResidual(device, queue, commandEncoder, seq_length, n_embd, embdOutputBuffer, posEmbdOutputBuffer);
   let layerOutputBuffer = embeddedInputBuffer;
 
+  let causalMask = [];
+
   for (let i = 0; i < n_layer; i++) {
     const buffers = layer_buffers[i];
 
@@ -102,6 +106,8 @@ async function runGPT(idx, doInitialization = true, doCropWeights = false) {
       buffers.normAttentionGammaBuffer,
       buffers.normAttentionBetaBuffer
     );
+
+    causalMask.push(buffers.attentionWeightCacheBuffer);
 
     let attentionOutputBuffer;
     if (doInitialization) {
@@ -170,6 +176,7 @@ async function runGPT(idx, doInitialization = true, doCropWeights = false) {
 
     layerOutputBuffer = residualLinearOutputBuffer;
   }
+  causalMask.push(layer_buffers[n_layer - 1].attentionWeightCacheBuffer);
 
   const layerNormOutputBuffer = inlineLayerNorm(device, queue, commandEncoder, seq_length, n_embd, layerOutputBuffer, normGammaBuffer, normBetaBuffer);
 
@@ -231,9 +238,21 @@ async function runGPT(idx, doInitialization = true, doCropWeights = false) {
 
   // const attentionWeightCacheBufferOutput = createOutputBuffer(device, commandEncoder, attentionWeightCacheBuffer, seq_length * n_head, seq_length);
 
+  const outputBuffers = [];
+  for (let i = 0; i < causalMask.length; i++) {
+    const outputBuffer = createOutputBuffer(device, commandEncoder, causalMask[i], seq_length * n_head, seq_length);
+    outputBuffers.push(outputBuffer);
+  }
+
   queue.submit([commandEncoder.finish()]);
 
   // await attentionWeightCacheBufferOutput.mapAsync(GPUMapMode.READ);
+  for (let i = 0; i < outputBuffers.length; i++) {
+    await outputBuffers[i].mapAsync(GPUMapMode.READ);
+    console.log("Attention layer", i);
+    console.log(formatAsMatrix(new Float32Array(outputBuffers[i].getMappedRange()), seq_length * n_head, seq_length));
+  }
+
   await deEmbedOutputBuffer.mapAsync(GPUMapMode.READ);
   const output = deEmbedOutputBuffer.getMappedRange();
   // console.log("attention cache", new Float32Array(attentionWeightCacheBufferOutput));
