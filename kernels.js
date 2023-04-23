@@ -68,6 +68,41 @@ const maskedNegMaxShader = `
   }
 `;
 
+// Return maximum value of each row in a matrix times -1.
+const maskedNegMaxShader = `
+  struct Matrix {
+    data: array<f32>,
+  }
+
+  struct Dimensions {
+    dimY: u32, // row dimension
+    dimX: u32, // col dimension
+  };
+
+  @group(0) @binding(0) var<uniform> DimBuffer: Dimensions;
+  @group(0) @binding(1) var<storage, read_write> Result: Matrix;
+  @group(1) @binding(0) var<storage, read> Input: Matrix;
+
+  @compute @workgroup_size(16, 16)
+  fn main (@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let row: u32 = global_id.x;
+    let dimX: u32 = DimBuffer.dimX;
+
+    if (row >= DimBuffer.dimY) {
+      return;
+    }
+
+    let rowMask: u32 = row % dimX;
+
+    var max_buffer: f32 = 0.0;
+    for (var i: u32 = 0; i < rowMask; i = i + 1) {
+      max_buffer = max(max_buffer, Input.data[row * dimX + i]);
+    }
+
+    Result.data[row] = -max_buffer;
+  }
+`;
+
 // Adds constants [rows, 1] to each row of a matrix [rows, cols].
 const addShader = `
   struct Matrix {
@@ -303,41 +338,6 @@ const causalMaskShader = `
       } else {
         Result.data[row * dimX + col] = Input.data[rowMask * dimY + col + rowNum * dimX];
       }
-
-    }
-`;
-
-// Masks all values in the matrix that are not causal to 0.
-// Currently also transposes the matrix for copying.
-const simpleCausalMaskShader = `
-  struct Matrix {
-      data: array<f32>,
-  }
-
-  struct Dimensions {
-    dimY: u32, // row dimension of input matrix
-    dimX: u32, // col dimension of input matrix
-  };
-
-  @group(0) @binding(0) var<uniform> DimBuffer: Dimensions;
-  @group(0) @binding(1) var<storage, read_write> Result: Matrix;
-
-  @group(1) @binding(0) var<storage, read> Input: Matrix;
-
-  @compute @workgroup_size(16, 16)
-  fn main (@builtin(global_invocation_id) global_id: vec3<u32>) {
-      let row: u32 = global_id.x;
-      let col: u32 = global_id.y;
-      let dimX: u32 = DimBuffer.dimX;
-      let dimY: u32 = DimBuffer.dimY;
-
-      let rowMask: u32 = row % dimX;
-      if (row >= dimY || col > rowMask) {
-        return;
-      }
-
-      let rowNum: u32 = row / dimX;
-      Result.data[row * dimX + col] = Input.data[rowMask * dimY + col + rowNum * dimX];
 
     }
 `;
@@ -1178,10 +1178,6 @@ function inlineAttention(
   linearBiasBuffer,
   attentionCacheBuffer
 ) {
-  if (n_embd % n_head != 0) {
-    throw new Error("cols must be divisible by n_head");
-  }
-
   const qkvUniformBuffer = createBuffer(device, 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
   const qkvResultBuffer = createBuffer(device, bufferSizeCalc(seq_length, 3 * n_embd), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
   const qkvBindGroup = createBindGroup(device, u_r_r_s_BindLayout, [qkvUniformBuffer, qkvBiasBuffer, qkvWeightsBuffer, qkvResultBuffer]);
@@ -1256,10 +1252,34 @@ function inlineAttention(
   passEncoder_causalMask.dispatchWorkgroups(workgroupCalc(seq_length * n_head, workgroup_Y), workgroupCalc(seq_length, workgroup_X));
   passEncoder_causalMask.end();
 
-  // Save for next iteration.
-  commandEncoder.copyBufferToBuffer(causalMaskResultBuffer, 0, attentionCacheBuffer, 0, bufferSizeCalc(seq_length * n_head, seq_length));
-
-  const softmaxOutputBuffer = maskedInlineSoftmax(device, queue, commandEncoder, seq_length * n_head, seq_length, causalMaskResultBuffer);
+  // This is a sloppy-ish solution to the casual mask buffer being processed with every head at once. Obviously, this could be fixed if we just did this in a smarter way but I only realized you could do this at the end. Still learning WebGPU!
+  const softmaxOutputBuffer = createBuffer(
+    device,
+    bufferSizeCalc(seq_length, seq_length * n_head),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
+  );
+  for (let i = 0; i < n_head; i++) {
+    const softmaxInputBuffer = createBuffer(
+      device,
+      bufferSizeCalc(seq_length, seq_length),
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
+    );
+    commandEncoder.copyBufferToBuffer(
+      causalMaskResultBuffer,
+      i * bufferSizeCalc(seq_length, seq_length),
+      softmaxInputBuffer,
+      0,
+      bufferSizeCalc(seq_length, seq_length)
+    );
+    const softMaxResultBuffer = inlineSoftmax(device, queue, commandEncoder, seq_length, seq_length, softmaxInputBuffer);
+    commandEncoder.copyBufferToBuffer(
+      softMaxResultBuffer,
+      0,
+      softmaxOutputBuffer,
+      i * bufferSizeCalc(seq_length, seq_length),
+      bufferSizeCalc(seq_length, seq_length)
+    );
+  }
 
   const passEncoder_attentionValues = commandEncoder.beginComputePass();
   passEncoder_attentionValues.setPipeline(attentionValuesPipeline);
