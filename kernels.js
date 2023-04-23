@@ -1041,8 +1041,7 @@ function cachedInlineAttention(
   qkvBiasBuffer,
   linearWeightsBuffer,
   linearBiasBuffer,
-  attentionCacheBuffer,
-  doOverflowAttention
+  attentionCacheBuffer
 ) {
   // This could be cached as well.
   const qkvUniformBuffer = createBuffer(device, 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
@@ -1057,7 +1056,7 @@ function cachedInlineAttention(
   const splitQKVBindGroup = createBindGroup(device, u_s_s_s_BindLayout, [splitQKVUniformBuffer, splitQResultBuffer, splitKResultBuffer, splitVResultBuffer]);
   queue.writeBuffer(splitQKVUniformBuffer, 0, new Uint32Array([seq_length, n_embd]));
 
-  const singleQResultBuffer = createBuffer(device, bufferSizeCalc(1, n_embd), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
+  const singleQResultBuffer = createBuffer(device, bufferSizeCalc(n_embd), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
 
   const attentionWeightsUniformBuffer = createBuffer(device, 32, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
   const attentionWeightsResultBuffer = createBuffer(
@@ -1108,7 +1107,7 @@ function cachedInlineAttention(
   commandEncoder.copyBufferToBuffer(splitQResultBuffer, bufferSizeCalc(n_embd) * (seq_length - 1), singleQResultBuffer, 0, bufferSizeCalc(n_embd));
 
   const passEncoder_attentionWeights = commandEncoder.beginComputePass();
-  passEncoder_attentionWeights.setPipeline(attentionWeightsPipeline);
+  passEncoder_attentionWeights.setPipeline(attentionWeightsNewPipeline);
   passEncoder_attentionWeights.setBindGroup(0, attentionWeightsBindGroup);
   passEncoder_attentionWeights.setBindGroup(1, createBindGroup(device, r_r_BindLayout, [singleQResultBuffer, splitKResultBuffer]));
   passEncoder_attentionWeights.dispatchWorkgroups(workgroupCalc(1, workgroup_Y), workgroupCalc(seq_length * n_head, workgroup_X));
@@ -1121,7 +1120,7 @@ function cachedInlineAttention(
   passEncoder_multiply.dispatchWorkgroups(workgroupCalc(1, workgroup_Y), workgroupCalc(seq_length * n_head, workgroup_X));
   passEncoder_multiply.end();
 
-  for (let i = 0; i < n_head - 1; i++) {
+  for (let i = 0; i < n_head; i++) {
     commandEncoder.copyBufferToBuffer(
       multiplyResultBuffer,
       bufferSizeCalc(seq_length) * i,
@@ -1130,29 +1129,15 @@ function cachedInlineAttention(
       bufferSizeCalc(seq_length)
     );
   }
-  if (doOverflowAttention) {
-    for (let i = 0; i < n_head; i++) {
-      for (let j = 1; j < seq_length; j++) {
-        commandEncoder.copyBufferToBuffer(
-          attentionCacheBuffer,
-          bufferSizeCalc(seq_length) * j + bufferSizeCalc(seq_length, seq_length) * i + 1 * Float32Array.BYTES_PER_ELEMENT,
-          causalMaskCachedResultBuffer,
-          bufferSizeCalc(seq_length) * (j - 1) + bufferSizeCalc(seq_length, seq_length) * i,
-          bufferSizeCalc(seq_length - 1)
-        );
-      }
-    }
-  } else {
-    for (let i = 0; i < n_head; i++) {
-      for (let j = 0; j < seq_length - 1; j++) {
-        commandEncoder.copyBufferToBuffer(
-          attentionCacheBuffer,
-          bufferSizeCalc(seq_length - 1) * j + bufferSizeCalc(seq_length - 1, seq_length - 1) * i,
-          causalMaskCachedResultBuffer,
-          bufferSizeCalc(seq_length) * j + bufferSizeCalc(seq_length, seq_length) * i,
-          bufferSizeCalc(seq_length - 1)
-        );
-      }
+  for (let i = 0; i < n_head; i++) {
+    for (let j = 0; j < seq_length - 1; j++) {
+      commandEncoder.copyBufferToBuffer(
+        attentionCacheBuffer,
+        bufferSizeCalc(seq_length - 1) * j + bufferSizeCalc(seq_length - 1, seq_length - 1) * i,
+        causalMaskCachedResultBuffer,
+        bufferSizeCalc(seq_length) * j + bufferSizeCalc(seq_length, seq_length) * i,
+        bufferSizeCalc(seq_length - 1)
+      );
     }
   }
 
@@ -1290,14 +1275,5 @@ function inlineAttention(
   passEncoder_linear.dispatchWorkgroups(workgroupCalc(seq_length, workgroup_Y), workgroupCalc(n_embd, workgroup_X));
   passEncoder_linear.end();
 
-  return {
-    linearResultBuffer,
-    causalMaskResultBuffer,
-    multiplyResultBuffer,
-    attentionWeightsResultBuffer,
-    qkvResultBuffer,
-    splitQResultBuffer,
-    splitKResultBuffer,
-    splitVResultBuffer,
-  };
+  return linearResultBuffer;
 }

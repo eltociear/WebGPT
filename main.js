@@ -27,15 +27,19 @@ async function* generate(prompt, max_new_tokens, top_k = 10, temperature = 1.0) 
   console.log("Starting generation with prompt", prompt);
   let history = tokenizer.encode(prompt);
 
+  let averageExecutionTime = 0;
+
   const block_size = modelParams.params.block_size;
   for (let i = 0; i < max_new_tokens; i++) {
     const idx_cond = history.slice(-block_size);
 
     const startTime = performance.now();
-    const logits = await runGPT(idx_cond, true, history.length > block_size);
+    const logits = await runGPT(idx_cond, i === 0 || history.length > block_size);
     const endTime = performance.now();
 
     console.log(`Kernel execution time: ${endTime - startTime} ms`);
+
+    averageExecutionTime += endTime - startTime;
 
     const { topKIndices, topKProbs } = selectTopK(logits, top_k);
     const probs = cpuSoftmax(topKProbs, temperature);
@@ -47,9 +51,11 @@ async function* generate(prompt, max_new_tokens, top_k = 10, temperature = 1.0) 
 
     yield tokenizer.decode([idx_next]);
   }
+
+  console.log(`Average kernel execution time: ${averageExecutionTime / max_new_tokens} ms`);
 }
 
-async function runGPT(idx, doInitialization = true, doCropWeights = false) {
+async function runGPT(idx, useAttentionCache = true) {
   if (!modelParams) {
     console.log("Model not loaded yet");
     return;
@@ -91,8 +97,6 @@ async function runGPT(idx, doInitialization = true, doCropWeights = false) {
   const embeddedInputBuffer = inlineResidual(device, queue, commandEncoder, seq_length, n_embd, embdOutputBuffer, posEmbdOutputBuffer);
   let layerOutputBuffer = embeddedInputBuffer;
 
-  let attentionOutputBuffers = [];
-
   for (let i = 0; i < n_layer; i++) {
     const buffers = layer_buffers[i];
 
@@ -108,8 +112,8 @@ async function runGPT(idx, doInitialization = true, doCropWeights = false) {
     );
 
     let attentionOutputBuffer;
-    if (doInitialization || true) {
-      const { linearResultBuffer, causalMaskResultBuffer, multiplyResultBuffer, attentionWeightsResultBuffer, qkvResultBuffer } = inlineAttention(
+    if (useAttentionCache) {
+      attentionOutputBuffer = inlineAttention(
         device,
         queue,
         commandEncoder,
@@ -124,8 +128,6 @@ async function runGPT(idx, doInitialization = true, doCropWeights = false) {
         buffers.linearBiasBuffer,
         buffers.attentionWeightCacheBuffer
       );
-      attentionOutputBuffer = linearResultBuffer;
-      if (i == 0) attentionOutputBuffers.push(causalMaskResultBuffer, multiplyResultBuffer, attentionWeightsResultBuffer, qkvResultBuffer);
     } else {
       attentionOutputBuffer = cachedInlineAttention(
         device,
@@ -140,8 +142,7 @@ async function runGPT(idx, doInitialization = true, doCropWeights = false) {
         buffers.qkvBiasBuffer,
         buffers.linearWeightsBuffer,
         buffers.linearBiasBuffer,
-        buffers.attentionWeightCacheBuffer,
-        doCropWeights
+        buffers.attentionWeightCacheBuffer
       );
     }
 
@@ -176,7 +177,6 @@ async function runGPT(idx, doInitialization = true, doCropWeights = false) {
 
     layerOutputBuffer = residualLinearOutputBuffer;
   }
-  // attentionOutputBuffers.push(layer_buffers[n_layer - 1].attentionWeightCacheBuffer);
 
   const layerNormOutputBuffer = inlineLayerNorm(device, queue, commandEncoder, seq_length, n_embd, layerOutputBuffer, normGammaBuffer, normBetaBuffer);
 
@@ -236,36 +236,7 @@ async function runGPT(idx, doInitialization = true, doCropWeights = false) {
     commandEncoder.copyBufferToBuffer(deEmbedChunkResultBuffer, 0, deEmbedOutputBuffer, i * bufferSizeCalc(vocabChunkSize), bufferSizeCalc(vocabChunkSize));
   }
 
-  // const attentionWeightCacheBufferOutput = createOutputBuffer(device, commandEncoder, attentionWeightCacheBuffer, seq_length * n_head, seq_length);
-
-  const outputBuffers = [];
-  for (let i = 0; i < attentionOutputBuffers.length / 4; i++) {
-    const outputBuffer1 = createOutputBuffer(device, commandEncoder, attentionOutputBuffers[i], seq_length * n_head, seq_length);
-    const outputBuffer2 = createOutputBuffer(device, commandEncoder, attentionOutputBuffers[i + 1], seq_length, seq_length * n_head);
-    const outputBuffer3 = createOutputBuffer(device, commandEncoder, attentionOutputBuffers[i + 2], seq_length, seq_length * n_head);
-    const outputBuffer4 = createOutputBuffer(device, commandEncoder, attentionOutputBuffers[i + 3], seq_length, n_embd * 3);
-    outputBuffers.push(outputBuffer1, outputBuffer2, outputBuffer3, outputBuffer4);
-  }
-
   queue.submit([commandEncoder.finish()]);
-
-  console.log(outputBuffers, attentionOutputBuffers);
-
-  // await attentionWeightCacheBufferOutput.mapAsync(GPUMapMode.READ);
-  for (let i = 0; i < outputBuffers.length / 4; i++) {
-    await outputBuffers[i].mapAsync(GPUMapMode.READ);
-    await outputBuffers[i + 1].mapAsync(GPUMapMode.READ);
-    await outputBuffers[i + 2].mapAsync(GPUMapMode.READ);
-    await outputBuffers[i + 3].mapAsync(GPUMapMode.READ);
-
-    const qkv = new Float32Array(outputBuffers[i + 3].getMappedRange());
-
-    console.log("Attention layer", i * 4);
-    console.log("qkv", qkv, formatAsMatrix(qkv, seq_length, n_embd * 3));
-    console.log("attention weights", formatAsMatrix(new Float32Array(outputBuffers[i + 2].getMappedRange()), seq_length, seq_length * n_head));
-    console.log("multiply result", formatAsMatrix(new Float32Array(outputBuffers[i + 1].getMappedRange()), seq_length, seq_length * n_head));
-    console.log("causal mask", formatAsMatrix(new Float32Array(outputBuffers[i].getMappedRange()), seq_length * n_head, seq_length));
-  }
 
   await deEmbedOutputBuffer.mapAsync(GPUMapMode.READ);
   const output = deEmbedOutputBuffer.getMappedRange();
